@@ -340,48 +340,48 @@ class SearchUnavailableError(SourceUnavailableError):
 def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
     """Search for books matching the query.
 
+    Tries Libgen first, then falls back to Anna's Archive.
+
     Args:
         query: Search term (ISBN, title, author, etc.)
         filters: Search filters (language, format, content type, etc.)
-
     Returns:
         List[BrowseRecord]: List of matching books
-
     Raises:
-        SearchUnavailableError: If Anna's Archive cannot be reached
+        SearchUnavailableError: If no source can be reached
         Exception: If parsing fails
-
     """
-    query_html = quote(query)
+    # --- Try Libgen first ---
+    try:
+        libgen_results = _search_books_libgen(query, filters)
+        if libgen_results:
+            return libgen_results
+        logger.info("Libgen search returned no results for query: %s, falling back to AA", query)
+    except Exception as e:
+        logger.warning("Libgen search failed for query %s: %s, falling back to AA", query, e)
 
+    # --- Fall back to Anna's Archive ---
+    query_html = quote(query)
     if filters.isbn:
         isbns = " || ".join([f"('isbn13:{isbn}' || 'isbn10:{isbn}')" for isbn in filters.isbn])
         query_html = quote(f"({isbns}) {query}")
-
     filters_query = ""
-
     for value in filters.lang or []:
         if value and value != "all":
             filters_query += f"&lang={quote(value)}"
-
     if filters.sort and filters.sort != "relevance":
         filters_query += f"&sort={quote(filters.sort)}"
-
     if filters.content:
         for value in filters.content:
             filters_query += f"&content={quote(value)}"
-
     formats_to_use = filters.format or _get_supported_formats()
-
     index = 1
     for filter_type, filter_values in vars(filters).items():
         if filter_type in ("author", "title") and filter_values:
             for value in filter_values:
                 filters_query += f"&termtype_{index}={filter_type}&termval_{index}={quote(value)}"
                 index += 1
-
     selector = network.AAMirrorSelector()
-
     url = (
         f"{network.get_aa_base_url()}"
         f"/search?index=&page=1&display=table"
@@ -390,20 +390,15 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
         f"&q={query_html}"
         f"{filters_query}"
     )
-
     html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=False)
     if not html:
-        # Network/mirror exhaustion path bubbles up so API can notify clients
         msg = "Unable to reach download source. Network restricted or mirrors are blocked."
         raise SearchUnavailableError(msg)
-
     if "No files found." in html:
         logger.info("No books found for query: %s", query)
         return []
-
     soup = BeautifulSoup(_html_response_text(html), "html.parser")
     tbody = soup.find("table")
-
     if tbody is None:
         logger.warning("No results table found for query: %s", query)
         msg = "No books found. Please try another query."
@@ -411,15 +406,12 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
     if not isinstance(tbody, Tag):
         msg = f"Expected results table tag, got {type(tbody).__name__}"
         raise TypeError(msg)
-
     books = []
     for line_tr in tbody.find_all("tr"):
         book = _parse_search_result_row(line_tr)
         if book:
             books.append(book)
-
     supported_formats = _get_supported_formats()
-
     books.sort(
         key=lambda x: (
             supported_formats.index(x.format)
@@ -427,7 +419,6 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
             else len(supported_formats)
         )
     )
-
     return books
 
 
@@ -1051,6 +1042,141 @@ def _extract_libgen_download_url(link: str, cancel_flag: Event | None = None) ->
     else:
         return download_url
 
+def _parse_libgen_search_result_row(row: Tag) -> BrowseRecord | None:
+    """Parse a single Libgen search result row into a browse record."""
+    try:
+        cells = row.find_all("td")
+        if len(cells) < 9:
+            return None
+        # Libgen table columns: ID, Author, Title, Publisher, Year, Pages, Language, Size, Extension
+        record_id_cell = cells[0].find("a", href=True)
+        if not record_id_cell:
+            return None
+        record_id = (_get_attr(record_id_cell, "href") or "").split("/")[-1]
+        if not record_id:
+            return None
+
+        author = cells[1].get_text(strip=True) or None
+        # Title cell contains the main link
+        title_anchor = cells[2].find("a", href=True)
+        title = title_anchor.get_text(strip=True) if title_anchor else cells[2].get_text(strip=True)
+        title = title or None
+        publisher = cells[3].get_text(strip=True) or None
+        year = cells[4].get_text(strip=True) or None
+        language = cells[6].get_text(strip=True) or None
+        size = cells[7].get_text(strip=True) or None
+        file_format = cells[8].get_text(strip=True) or None
+
+        if title is None or author is None or file_format is None:
+            return None
+
+        # Build an MD5-resolvable ID from the title anchor href if possible
+        # Libgen book page URLs look like: /book/index.php?md5=XXXX
+        md5 = None
+        if title_anchor:
+            href = _get_attr(title_anchor, "href") or ""
+            md5_match = re.search(r"md5=([a-fA-F0-9]{32})", href)
+            if md5_match:
+                md5 = md5_match.group(1).lower()
+
+        return BrowseRecord(
+            id=md5 or record_id,
+            title=title,
+            source="direct_download",
+            preview=None,
+            author=author,
+            publisher=publisher,
+            year=year,
+            language=language,
+            content=None,
+            format=file_format.lower() if file_format else None,
+            size=size,
+        )
+    except (AttributeError, IndexError, KeyError, TypeError) as e:
+        logger.error_trace(f"Error parsing Libgen search result row: {e}")
+        return None
+
+
+def _search_books_libgen(query: str, filters: SearchFilters) -> list[BrowseRecord]:
+    """Search Libgen directly and return results as BrowseRecords.
+
+    Uses Libgen's search.php endpoint. Falls back to empty list on any failure
+    so the caller can decide whether to try AA or raise.
+    """
+    from shelfmark.core.mirrors import get_libgen_mirrors
+
+    mirrors = get_libgen_mirrors()
+    if not mirrors:
+        logger.warning("No Libgen mirrors configured, skipping Libgen search")
+        return []
+
+    formats_to_use = filters.format or _get_supported_formats()
+    # Libgen search works best with a simple title+author query
+    search_term = query
+    if filters.isbn:
+        # Libgen supports ISBN search via the same field
+        search_term = filters.isbn[0]
+
+    params = f"req={quote(search_term)}&lg_topic=libgen&open=0&view=simple&res=100&phrase=1&column=def"
+
+    for mirror in mirrors:
+        mirror_url = str(mirror).rstrip("/")
+        url = f"{mirror_url}/search.php?{params}"
+        logger.info("Libgen search: trying %s", url)
+        try:
+            response = requests.get(
+                url,
+                headers=downloader.DOWNLOAD_HEADERS,
+                timeout=(5, 15),
+                allow_redirects=True,
+                proxies=network.get_proxies(url),
+                verify=network.get_ssl_verify(url),
+            )
+            if response.status_code != HTTPStatus.OK:
+                logger.warning("Libgen search: %s returned %s", url, response.status_code)
+                continue
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            # Libgen results are in a table with id="searchtable"
+            table = soup.find("table", {"id": "searchtable"})
+            if not isinstance(table, Tag):
+                logger.warning("Libgen search: no results table found at %s", url)
+                continue
+
+            books = []
+            for row in table.find_all("tr"):
+                # Skip header row
+                if row.find("th"):
+                    continue
+                record = _parse_libgen_search_result_row(row)
+                if record is None:
+                    continue
+                # Apply format filter
+                if formats_to_use and record.format and record.format not in [f.lower() for f in formats_to_use]:
+                    continue
+                # Apply language filter
+                if filters.lang and "all" not in filters.lang and record.language:
+                    if not any(record.language.lower().startswith(lang.lower()) for lang in filters.lang):
+                        continue
+                books.append(record)
+
+            supported_formats = _get_supported_formats()
+            books.sort(
+                key=lambda x: (
+                    supported_formats.index(x.format)
+                    if x.format in supported_formats
+                    else len(supported_formats)
+                )
+            )
+            logger.info("Libgen search: found %d results at %s", len(books), url)
+            return books
+
+        except requests.exceptions.RequestException as e:
+            logger.warning("Libgen search: request failed for %s: %s", url, e)
+            continue
+
+    logger.warning("Libgen search: all mirrors failed for query: %s", query)
+    return []
 
 def _download_book(
     book_info: BrowseRecord,
