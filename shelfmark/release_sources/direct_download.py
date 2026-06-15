@@ -1039,55 +1039,74 @@ def _extract_libgen_download_url(link: str, cancel_flag: Event | None = None) ->
     else:
         return download_url
 
-def _parse_libgen_search_result_row(row: Tag) -> BrowseRecord | None:
+def _parse_libgen_li_row(cells: list) -> dict | None:
+    """Parse libgen.li row (tablelibgen) — no thumbnail column."""
+    # cols: 0=title, 1=author, 2=publisher, 3=year, 4=language, 5=pages, 6=size, 7=format, 8=links
+    if len(cells) < 8:
+        return None
+    return {
+        "title": cells[0].get_text(strip=True) or None,
+        "author": cells[1].get_text(strip=True) or None,
+        "publisher": cells[2].get_text(strip=True) or None,
+        "year": cells[3].get_text(strip=True) or None,
+        "language": cells[4].get_text(strip=True) or None,
+        "size": cells[6].get_text(strip=True) or None,
+        "format": cells[7].get_text(strip=True) or None,
+    }
+
+
+def _parse_libgen_rs_row(cells: list) -> dict | None:
+    """Parse libgen.rs/libgen.is row (searchtable) — has thumbnail and ID columns."""
+    # cols: 0=thumb, 1=id, 2=author, 3=title, 4=publisher, 5=year, 6=language, 7=pages, 8=size, 9=format
+    if len(cells) < 10:
+        return None
+    return {
+        "title": cells[3].get_text(strip=True) or None,
+        "author": cells[2].get_text(strip=True) or None,
+        "publisher": cells[4].get_text(strip=True) or None,
+        "year": cells[5].get_text(strip=True) or None,
+        "language": cells[6].get_text(strip=True) or None,
+        "size": cells[8].get_text(strip=True) or None,
+        "format": cells[9].get_text(strip=True) or None,
+    }
+
+
+def _parse_libgen_search_result_row(row: Tag, table_id: str) -> BrowseRecord | None:
     """Parse a single Libgen search result row into a browse record."""
     try:
         cells = row.find_all("td")
-        if len(cells) < 9:
-            return None
-        # Libgen table columns: ID, Author, Title, Publisher, Year, Pages, Language, Size, Extension
-        record_id_cell = cells[0].find("a", href=True)
-        if not record_id_cell:
-            return None
-        record_id = (_get_attr(record_id_cell, "href") or "").split("/")[-1]
-        if not record_id:
+        if not cells:
             return None
 
-        author = cells[1].get_text(strip=True) or None
-        # Title cell contains the main link
-        title_anchor = cells[2].find("a", href=True)
-        title = title_anchor.get_text(strip=True) if title_anchor else cells[2].get_text(strip=True)
-        title = title or None
-        publisher = cells[3].get_text(strip=True) or None
-        year = cells[4].get_text(strip=True) or None
-        language = cells[6].get_text(strip=True) or None
-        size = cells[7].get_text(strip=True) or None
-        file_format = cells[8].get_text(strip=True) or None
-
-        if title is None or author is None or file_format is None:
-            return None
-
-        # Build an MD5-resolvable ID from the title anchor href if possible
-        # Libgen book page URLs look like: /book/index.php?md5=XXXX
+        # Extract MD5 from any link in the row
         md5 = None
-        if title_anchor:
-            href = _get_attr(title_anchor, "href") or ""
-            md5_match = re.search(r"md5=([a-fA-F0-9]{32})", href)
+        for anchor in row.find_all("a", href=True):
+            href = _get_attr(anchor, "href") or ""
+            md5_match = re.search(r"md5=([a-fA-F0-9]{32})", href, re.IGNORECASE)
             if md5_match:
                 md5 = md5_match.group(1).lower()
+                break
+
+        if table_id == "tablelibgen":
+            data = _parse_libgen_li_row(cells)
+        else:
+            data = _parse_libgen_rs_row(cells)
+
+        if data is None or data.get("title") is None or data.get("format") is None:
+            return None
 
         return BrowseRecord(
-            id=md5 or record_id,
-            title=title,
+            id=md5 or data["title"],
+            title=data["title"],
             source="direct_download",
             preview=None,
-            author=author,
-            publisher=publisher,
-            year=year,
-            language=language,
+            author=data.get("author"),
+            publisher=data.get("publisher"),
+            year=data.get("year"),
+            language=data.get("language"),
             content=None,
-            format=file_format.lower() if file_format else None,
-            size=size,
+            format=data["format"].lower(),
+            size=data.get("size"),
         )
     except (AttributeError, IndexError, KeyError, TypeError) as e:
         logger.error_trace(f"Error parsing Libgen search result row: {e}")
@@ -1140,12 +1159,12 @@ def _search_books_libgen(query: str, filters: SearchFilters) -> list[BrowseRecor
                 logger.warning("Libgen search: no results table found at %s", url)
                 continue
 
+            table_id = table.get("id") or ""
             books = []
             for row in table.find_all("tr"):
-                # Skip header row
-                if row.find("th"):
+                if not row.find_all("td"):  # skip header rows
                     continue
-                record = _parse_libgen_search_result_row(row)
+                record = _parse_libgen_search_result_row(row, table_id)
                 if record is None:
                     continue
                 # Apply format filter
