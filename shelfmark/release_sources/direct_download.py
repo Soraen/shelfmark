@@ -303,18 +303,15 @@ def _is_source_enabled(source_id: str) -> bool:
 def _get_direct_download_unavailable_reason() -> str | None:
     """Return a user-facing reason when Direct Download cannot be used."""
     from shelfmark.core import mirrors
-
     if not config.get("DIRECT_DOWNLOAD_ENABLED", False):
         return (
             "Direct Download is disabled. Enable the source in Settings and add your mirror URLs."
         )
-
-    if not mirrors.has_aa_mirror_configuration():
+    if not mirrors.has_aa_mirror_configuration() and not mirrors.get_libgen_mirrors():
         return (
-            "Direct Download is not configured. Add at least one Anna's Archive mirror URL in "
-            "Settings."
+            "Direct Download is not configured. Add at least one Anna's Archive or Libgen mirror "
+            "URL in Settings."
         )
-
     return None
 
 
