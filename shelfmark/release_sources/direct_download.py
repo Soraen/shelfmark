@@ -1135,11 +1135,10 @@ def _search_books_libgen(query: str, filters: SearchFilters) -> list[BrowseRecor
                 continue
 
             soup = BeautifulSoup(response.text, "html.parser")
-            # Libgen results are in a table with id="searchtable"
-            table = soup.find("table", {"id": "searchtable"})
-            if not isinstance(table, Tag):
-                logger.warning("Libgen search: no results table found at %s", url)
-                continue
+            table = soup.find("table", {"id": "tablelibgen"}) or soup.find("table", {"id": "searchtable"})
+                if not isinstance(table, Tag):
+                    logger.warning("Libgen search: no results table found at %s", url)
+                    continue
 
             books = []
             for row in table.find_all("tr"):
