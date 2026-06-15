@@ -1118,7 +1118,8 @@ def _search_books_libgen(query: str, filters: SearchFilters) -> list[BrowseRecor
 
     for mirror in mirrors:
         mirror_url = str(mirror).rstrip("/")
-        url = f"{mirror_url}/search.php?{params}"
+        search_path = "index.php" if "libgen.li" in mirror_url else "search.php"
+        url = f"{mirror_url}/{search_path}?{params}"
         logger.info("Libgen search: trying %s", url)
         try:
             response = requests.get(
